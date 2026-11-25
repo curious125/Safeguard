@@ -42,6 +42,11 @@ function getCategoryStyles(category: FlagCategory): {
         markClass: 'bg-blue-100 text-blue-950 border border-blue-300',
         labelClass: 'text-blue-800',
       };
+    default:
+      return {
+        markClass: 'bg-amber-100 text-amber-950 border border-amber-300',
+        labelClass: 'text-amber-800',
+      };
   }
 }
 
@@ -104,19 +109,32 @@ function buildHighlightedSegments(
 
 export function ResultsDashboard({ report }: ResultsDashboardProps) {
   const { analysis, fusion, clipLabel, processingMs } = report;
+  const flaggedPhrases = Array.isArray(analysis.flaggedPhrases)
+    ? analysis.flaggedPhrases
+    : [];
+  const acousticObservations = Array.isArray(analysis.acousticObservations)
+    ? analysis.acousticObservations
+    : [];
+  const reasons = Array.isArray(fusion.reasons) ? fusion.reasons : [];
   const [selectedPhrase, setSelectedPhrase] = useState<FlaggedPhrase | null>(
-    analysis.flaggedPhrases[0] ?? null
+    flaggedPhrases[0] ?? null
   );
 
-  const syntheticPct = Math.round(analysis.syntheticProbability * 100);
-  const scamPct = Math.round(analysis.scamLanguageScore * 100);
+  const syntheticProb = Number.isFinite(Number(analysis.syntheticProbability))
+    ? Number(analysis.syntheticProbability)
+    : 0.5;
+  const scamScore = Number.isFinite(Number(analysis.scamLanguageScore))
+    ? Number(analysis.scamLanguageScore)
+    : 0;
+  const syntheticPct = Math.round(syntheticProb * 100);
+  const scamPct = Math.round(scamScore * 100);
 
   let bannerStyles = {
     wrapper: 'bg-emerald-50 border-emerald-300 text-emerald-950',
     iconBg: 'bg-emerald-700 text-white',
     heading: 'Low Risk — Routine Call Indicators',
     sub: 'Voice acoustics look natural and no scam pressure phrases were found.',
-    icon: <CheckCircle2 className="w-7 h-7" aria-hidden="true" />,
+    icon: <CheckCircle2 className="w-6 h-6 sm:w-7 sm:h-7" aria-hidden="true" />,
   };
 
   if (fusion.riskLevel === 'HIGH RISK') {
@@ -125,7 +143,7 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
       iconBg: 'bg-red-700 text-white',
       heading: 'High Risk — Possible Voice-Clone or Scam Call',
       sub: 'Do not send money or share codes. Pause and verify with your family first.',
-      icon: <ShieldAlert className="w-7 h-7" aria-hidden="true" />,
+      icon: <ShieldAlert className="w-6 h-6 sm:w-7 sm:h-7" aria-hidden="true" />,
     };
   } else if (fusion.riskLevel === 'MEDIUM RISK') {
     bannerStyles = {
@@ -133,62 +151,69 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
       iconBg: 'bg-amber-600 text-white',
       heading: 'Medium Risk — Caution Recommended',
       sub: 'Verify the caller independently before acting on any request.',
-      icon: <AlertTriangle className="w-7 h-7" aria-hidden="true" />,
+      icon: <AlertTriangle className="w-6 h-6 sm:w-7 sm:h-7" aria-hidden="true" />,
     };
   }
 
   const segments = buildHighlightedSegments(
-    analysis.transcript,
-    analysis.flaggedPhrases
+    analysis.transcript || '',
+    flaggedPhrases
   );
 
   return (
-    <section aria-labelledby="results-heading" className="space-y-6">
+    <section aria-labelledby="results-heading" className="space-y-6 min-w-0">
       {/* 1. Primary Visual Risk Meter Banner */}
       <div
-        className={`rounded-xl border p-6 sm:p-8 shadow-xs ${bannerStyles.wrapper}`}
+        className={`rounded-xl border p-5 sm:p-8 shadow-xs min-w-0 overflow-hidden ${bannerStyles.wrapper}`}
       >
-        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-6">
-          <div className="flex items-start gap-4">
+        <div className="flex flex-col md:flex-row md:items-start md:justify-between gap-4 min-w-0">
+          <div className="flex items-start gap-3.5 sm:gap-4 flex-1 min-w-0">
             <div
-              className={`w-14 h-14 rounded-xl flex items-center justify-center shrink-0 ${bannerStyles.iconBg}`}
+              className={`w-12 h-12 sm:w-14 sm:h-14 rounded-xl flex items-center justify-center shrink-0 ${bannerStyles.iconBg}`}
             >
               {bannerStyles.icon}
             </div>
-            <div>
-              <div className="text-sm font-bold tracking-wide uppercase">
+            <div className="flex-1 min-w-0">
+              <div className="text-xs sm:text-sm font-bold tracking-wide uppercase">
                 {fusion.riskLevel}
               </div>
               <h2
                 id="results-heading"
-                className="text-2xl sm:text-3xl font-bold mt-1 text-balance"
+                className="text-2xl sm:text-3xl font-bold mt-1 leading-tight break-words text-balance"
               >
                 {bannerStyles.heading}
               </h2>
-              <p className="text-base mt-1.5 opacity-90">{bannerStyles.sub}</p>
+              <p className="text-base mt-1.5 opacity-90 break-words">
+                {bannerStyles.sub}
+              </p>
             </div>
           </div>
 
-          <div className="text-sm font-medium opacity-80 md:text-right shrink-0 tabular-nums">
-            <div>{clipLabel}</div>
-            <div className="mt-1">
-              {analysis.detectedLanguage} · Analyzed in {(processingMs / 1000).toFixed(1)}s
+          <div className="w-full md:w-auto md:max-w-[260px] min-w-0 text-sm font-medium opacity-85 md:text-right shrink-0 tabular-nums pt-2 md:pt-0 border-t border-black/10 md:border-t-0">
+            <div
+              className="font-semibold truncate"
+              title={clipLabel}
+            >
+              {clipLabel}
+            </div>
+            <div className="mt-1 break-words">
+              {analysis.detectedLanguage || 'Unknown'} · Analyzed in {(processingMs / 1000).toFixed(1)}s
             </div>
           </div>
         </div>
 
         {/* Plain-Language Reasons for Older Adults */}
-        <div className="mt-6 pt-6 border-t border-black/10">
+        <div className="mt-6 pt-5 border-t border-black/10 min-w-0">
           <h3 className="text-base font-bold mb-3">
             Why SafeVoice Guard Flagged This Result
           </h3>
           <ul className="space-y-2.5 text-base leading-relaxed">
-            {fusion.reasons.map((reason, idx) => (
-              <li key={idx} className="flex items-start gap-2.5">
+            {reasons.map((reason, idx) => (
+              <li key={idx} className="flex items-start gap-2.5 min-w-0">
                 <span className="font-mono font-bold mt-0.5 shrink-0">
                   {idx + 1}.
                 </span>
-                <span>{reason}</span>
+                <span className="min-w-0 break-words">{reason}</span>
               </li>
             ))}
           </ul>
@@ -196,12 +221,12 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
       </div>
 
       {/* 2. Dual-Signal Breakdown (Voice Authenticity + Scam Script Analysis) */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 items-stretch">
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-stretch">
         {/* Signal A: Voice Authenticity */}
-        <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs flex flex-col justify-between">
-          <div>
-            <div className="flex items-center justify-between gap-4">
-              <div className="flex items-center gap-2.5">
+        <div className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 shadow-xs flex flex-col justify-between min-w-0">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2.5 min-w-0">
                 <AudioWaveform
                   className="w-5 h-5 text-slate-700 shrink-0"
                   aria-hidden="true"
@@ -210,7 +235,7 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
                   Voice Authenticity Check
                 </h3>
               </div>
-              <span className="font-mono tabular-nums text-lg font-bold text-slate-900">
+              <span className="font-mono tabular-nums text-base sm:text-lg font-bold text-slate-900 shrink-0">
                 {syntheticPct}% synthetic
               </span>
             </div>
@@ -237,7 +262,6 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
                   style={{ width: '35%' }}
                   title="65–100%: Likely Synthetic"
                 />
-                {/* Indicator Marker */}
                 <div
                   className="absolute top-0 bottom-0 w-1 bg-slate-950 ring-2 ring-white"
                   style={{
@@ -247,8 +271,8 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
                 />
               </div>
 
-              <div className="mt-2 grid grid-cols-3 text-xs font-medium text-slate-600 tabular-nums">
-                <div>0–35% Likely Real</div>
+              <div className="mt-2 grid grid-cols-3 gap-1 text-[11px] sm:text-xs font-medium text-slate-600 tabular-nums">
+                <div>0–35% Real</div>
                 <div className="text-center">35–65% Uncertain</div>
                 <div className="text-right">65–100% Synthetic</div>
               </div>
@@ -259,14 +283,14 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
               <h4 className="text-sm font-bold text-slate-800 mb-2.5">
                 Acoustic Signals Observed
               </h4>
-              {analysis.acousticObservations.length > 0 ? (
+              {acousticObservations.length > 0 ? (
                 <ul className="space-y-2 text-sm sm:text-base text-slate-700 leading-relaxed">
-                  {analysis.acousticObservations.map((obs, index) => (
-                    <li key={index} className="flex items-start gap-2">
-                      <span aria-hidden="true" className="text-slate-400 mt-1">
+                  {acousticObservations.map((obs, index) => (
+                    <li key={index} className="flex items-start gap-2 min-w-0">
+                      <span aria-hidden="true" className="text-slate-400 mt-1 shrink-0">
                         •
                       </span>
-                      <span>{obs}</span>
+                      <span className="min-w-0 break-words">{obs}</span>
                     </li>
                   ))}
                 </ul>
@@ -280,10 +304,10 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
         </div>
 
         {/* Signal B: Scam Script Analysis */}
-        <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs flex flex-col justify-between">
-          <div>
-            <div className="flex items-center justify-between gap-4">
-              <div className="flex items-center gap-2.5">
+        <div className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 shadow-xs flex flex-col justify-between min-w-0">
+          <div className="min-w-0">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div className="flex items-center gap-2.5 min-w-0">
                 <MessageSquareWarning
                   className="w-5 h-5 text-slate-700 shrink-0"
                   aria-hidden="true"
@@ -292,18 +316,21 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
                   Scam Script Analysis
                 </h3>
               </div>
-              <span className="font-mono tabular-nums text-lg font-bold text-slate-900">
+              <span className="font-mono tabular-nums text-base sm:text-lg font-bold text-slate-900 shrink-0">
                 {scamPct}% risk score
               </span>
             </div>
 
-            <div className="mt-3 text-sm sm:text-base text-slate-700">
-              Spoken Language: <span className="font-semibold text-slate-900">{analysis.detectedLanguage}</span>
-              {' · '}
-              <span className="font-semibold text-slate-900 tabular-nums">
-                {analysis.flaggedPhrases.length}
+            <div className="mt-3 text-sm sm:text-base text-slate-700 break-words">
+              Spoken Language:{' '}
+              <span className="font-semibold text-slate-900">
+                {analysis.detectedLanguage || 'Unknown'}
               </span>{' '}
-              flagged {analysis.flaggedPhrases.length === 1 ? 'phrase' : 'phrases'}
+              ·{' '}
+              <span className="font-semibold text-slate-900 tabular-nums">
+                {flaggedPhrases.length}
+              </span>{' '}
+              flagged {flaggedPhrases.length === 1 ? 'phrase' : 'phrases'}
             </div>
 
             {/* Scam Score Progress Bar */}
@@ -320,9 +347,9 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
                   style={{ width: `${Math.max(4, scamPct)}%` }}
                 />
               </div>
-              <div className="mt-2 flex justify-between text-xs font-medium text-slate-600 tabular-nums">
+              <div className="mt-2 flex justify-between gap-2 text-[11px] sm:text-xs font-medium text-slate-600 tabular-nums">
                 <span>0% Benign Conversation</span>
-                <span>60%+ High Scam Intent</span>
+                <span className="text-right">60%+ High Scam Intent</span>
               </div>
             </div>
 
@@ -331,9 +358,9 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
               <h4 className="text-sm font-bold text-slate-800 mb-3">
                 Detected Manipulation Tactics
               </h4>
-              {analysis.flaggedPhrases.length > 0 ? (
+              {flaggedPhrases.length > 0 ? (
                 <div className="space-y-2.5">
-                  {analysis.flaggedPhrases.map((item, idx) => {
+                  {flaggedPhrases.map((item, idx) => {
                     const styles = getCategoryStyles(item.category);
                     const isSelected =
                       selectedPhrase?.phrase === item.phrase &&
@@ -343,21 +370,21 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
                         key={`${item.phrase}-${idx}`}
                         type="button"
                         onClick={() => setSelectedPhrase(item)}
-                        className={`w-full text-left p-3 rounded-lg border transition-colors ${
+                        className={`w-full text-left p-3 rounded-lg border transition-colors min-w-0 ${
                           isSelected
                             ? 'bg-slate-50 border-slate-400'
                             : 'bg-white border-slate-200 hover:bg-slate-50'
                         }`}
                       >
-                        <div className="flex flex-wrap items-baseline justify-between gap-2">
-                          <span className="font-semibold text-slate-900 text-base">
+                        <div className="flex flex-wrap items-baseline justify-between gap-2 min-w-0">
+                          <span className="font-semibold text-slate-900 text-base break-words min-w-0">
                             “{item.phrase}”
                           </span>
-                          <span className={`text-xs font-bold ${styles.labelClass}`}>
+                          <span className={`text-xs font-bold shrink-0 ${styles.labelClass}`}>
                             {item.category}
                           </span>
                         </div>
-                        <p className="text-sm text-slate-600 mt-1">
+                        <p className="text-sm text-slate-600 mt-1 break-words">
                           {item.explanation}
                         </p>
                       </button>
@@ -375,15 +402,15 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
       </div>
 
       {/* 3. Interactive Highlighted Transcript */}
-      <div className="bg-white border border-slate-200 rounded-xl p-6 sm:p-8 shadow-xs">
+      <div className="bg-white border border-slate-200 rounded-xl p-5 sm:p-8 shadow-xs min-w-0">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 pb-4 border-b border-slate-200">
-          <div className="flex items-center gap-2.5">
+          <div className="flex items-center gap-2.5 min-w-0">
             <Languages className="w-5 h-5 text-slate-700 shrink-0" aria-hidden="true" />
             <h3 className="text-lg sm:text-xl font-bold text-slate-900">
               Transcript &amp; Highlighted Warning Phrases
             </h3>
           </div>
-          <div className="flex flex-wrap items-center gap-3 text-xs font-semibold text-slate-700">
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs font-semibold text-slate-700">
             <span className="text-red-800">Red: Payment Request</span>
             <span aria-hidden="true">·</span>
             <span className="text-amber-800">Amber: Urgency</span>
@@ -394,9 +421,9 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
           </div>
         </div>
 
-        <div className="mt-5 text-lg sm:text-xl leading-relaxed text-slate-900">
+        <div className="mt-5 text-base sm:text-xl leading-relaxed text-slate-900 min-w-0 break-words">
           {analysis.transcript ? (
-            <p className="leading-[1.8]">
+            <p className="leading-[1.85] break-words">
               {segments.map((seg, i): ReactNode => {
                 if (!seg.match) {
                   return <span key={i}>{seg.text}</span>;
@@ -407,7 +434,7 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
                     key={i}
                     type="button"
                     onClick={() => setSelectedPhrase(seg.match ?? null)}
-                    className={`inline align-baseline mx-0.5 px-2 py-0.5 rounded-md font-semibold transition-opacity hover:opacity-90 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 ${styles.markClass}`}
+                    className={`inline text-left align-baseline mx-0.5 px-2 py-0.5 rounded-md font-semibold transition-opacity hover:opacity-90 break-words focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-900 ${styles.markClass}`}
                     title={`${seg.match.category}: ${seg.match.explanation}`}
                   >
                     <span>{seg.text}</span>
@@ -426,18 +453,18 @@ export function ResultsDashboard({ report }: ResultsDashboardProps) {
         </div>
 
         {selectedPhrase && (
-          <div className="mt-5 rounded-lg bg-slate-50 border border-slate-200 px-4 py-3 text-sm sm:text-base text-slate-800">
+          <div className="mt-5 rounded-lg bg-slate-50 border border-slate-200 px-4 py-3 text-sm sm:text-base text-slate-800 break-words">
             <span className="font-bold">{selectedPhrase.category}:</span>{' '}
             <span>{selectedPhrase.explanation}</span>
           </div>
         )}
 
         {analysis.englishTranslation && (
-          <div className="mt-6 pt-5 border-t border-slate-200">
+          <div className="mt-6 pt-5 border-t border-slate-200 min-w-0">
             <div className="text-sm font-bold text-slate-600">
               English Translation
             </div>
-            <p className="mt-1.5 text-base sm:text-lg text-slate-800 leading-relaxed">
+            <p className="mt-1.5 text-base sm:text-lg text-slate-800 leading-relaxed break-words">
               {analysis.englishTranslation}
             </p>
           </div>

@@ -18,6 +18,11 @@ const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT) || 3000;
 const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
+const PRIMARY_ANALYZE_MODEL = 'gemini-3.5-flash-lite';
+const FALLBACK_ANALYZE_MODEL = 'gemini-3.1-flash-lite';
+const TRANSIENT_RETRY_DELAYS_MS = [2000, 4000];
+let activeAnalyzeModel = PRIMARY_ANALYZE_MODEL;
+
 const ALLOWED_CATEGORIES = new Set([
   'Urgency',
   'Secrecy',
@@ -90,10 +95,13 @@ function getAiClient(): GoogleGenAI {
 function normalizeMimeType(rawMimeType: string): string {
   const base = rawMimeType.split(';')[0].trim().toLowerCase();
   if (!base) {
-    return 'audio/wav';
+    return 'audio/webm';
   }
   if (base === 'audio/m4a' || base === 'audio/x-m4a') {
     return 'audio/mp4';
+  }
+  if (base === 'audio/mp3') {
+    return 'audio/mpeg';
   }
   if (base === 'audio/x-wav' || base === 'audio/wave') {
     return 'audio/wav';
@@ -107,18 +115,75 @@ function normalizeMimeType(rawMimeType: string): string {
   return 'audio/wav';
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function parseReadableErrorMessage(rawMessage: string): string {
+  const trimmed = rawMessage.trim();
   try {
-    const parsed = JSON.parse(rawMessage) as {
+    const parsed = JSON.parse(trimmed) as {
       error?: { message?: string; code?: number; status?: string };
+      message?: string;
     };
     if (parsed?.error?.message) {
       return parsed.error.message;
     }
+    if (parsed?.message) {
+      return parsed.message;
+    }
   } catch {
-    // rawMessage is plain text
+    // Check if an embedded JSON object exists after a prefix
+    const jsonStart = trimmed.indexOf('{');
+    if (jsonStart !== -1) {
+      try {
+        const parsed = JSON.parse(trimmed.slice(jsonStart)) as {
+          error?: { message?: string };
+        };
+        if (parsed?.error?.message) {
+          return parsed.error.message;
+        }
+      } catch {
+        // Not valid JSON
+      }
+    }
   }
-  return rawMessage;
+  return trimmed;
+}
+
+function getGeminiErrorStatus(err: unknown): number | undefined {
+  if (err && typeof err === 'object' && 'status' in err) {
+    const numeric = Number((err as { status?: unknown }).status);
+    if (Number.isFinite(numeric) && numeric > 0) {
+      return numeric;
+    }
+  }
+  const raw = err instanceof Error ? err.message : String(err ?? '');
+  const lower = raw.toLowerCase();
+  if (lower.includes('429') || lower.includes('resource_exhausted')) {
+    return 429;
+  }
+  if (
+    lower.includes('503') ||
+    lower.includes('unavailable') ||
+    lower.includes('overloaded')
+  ) {
+    return 503;
+  }
+  if (lower.includes('404') || lower.includes('not_found')) {
+    return 404;
+  }
+  if (
+    lower.includes('403') ||
+    lower.includes('permission_denied') ||
+    lower.includes('api_key_invalid')
+  ) {
+    return 403;
+  }
+  if (lower.includes('400') || lower.includes('invalid_argument')) {
+    return 400;
+  }
+  return undefined;
 }
 
 function extractErrorDetails(err: unknown): { status: number; message: string } {
@@ -126,34 +191,40 @@ function extractErrorDetails(err: unknown): { status: number; message: string } 
     err instanceof Error ? err.message : 'Unexpected server error during audio analysis.';
   const readable = parseReadableErrorMessage(rawMessage);
   const lower = readable.toLowerCase();
+  const detectedStatus = getGeminiErrorStatus(err);
 
   if (
+    detectedStatus === 403 ||
     lower.includes('api_key_invalid') ||
-    lower.includes('permission_denied') ||
-    lower.includes('403')
+    lower.includes('permission_denied')
   ) {
     return {
       status: 403,
-      message: `Gemini API authentication failed: ${readable}`,
-    };
-  }
-  if (lower.includes('resource_exhausted') || lower.includes('429')) {
-    return {
-      status: 429,
       message:
-        'API rate limit reached. Please wait a few seconds and try analyzing again.',
+        'Gemini API authentication failed. Please verify your API key in Settings > Secrets.',
     };
   }
-  if (lower.includes('invalid_argument') || lower.includes('400')) {
+  if (
+    detectedStatus === 429 ||
+    detectedStatus === 503 ||
+    lower.includes('resource_exhausted') ||
+    lower.includes('unavailable')
+  ) {
+    return {
+      status: detectedStatus === 503 ? 503 : 429,
+      message: 'High traffic — please wait 15 seconds and try again.',
+    };
+  }
+  if (detectedStatus === 400 || lower.includes('invalid_argument')) {
     return {
       status: 400,
-      message: `Gemini rejected the audio request: ${readable}`,
+      message: readable || rawMessage,
     };
   }
-  if (lower.includes('not_found') || lower.includes('404')) {
+  if (detectedStatus === 404 || lower.includes('not_found')) {
     return {
       status: 502,
-      message: `Model endpoint unavailable: ${readable}`,
+      message: readable || rawMessage,
     };
   }
   if (lower.includes('gemini_api_key is not configured')) {
@@ -163,8 +234,8 @@ function extractErrorDetails(err: unknown): { status: number; message: string } 
     };
   }
   return {
-    status: 500,
-    message: readable,
+    status: detectedStatus && detectedStatus >= 400 ? detectedStatus : 500,
+    message: readable || rawMessage,
   };
 }
 
@@ -302,7 +373,7 @@ async function startServer(): Promise<void> {
     try {
       const ai = getAiClient();
 
-      const prompt = `You are SafeVoice Guard, a defensive voice-scam and deepfake audio analyzer helping families detect voice-cloning fraud and social engineering calls.
+      const systemInstruction = `You are SafeVoice Guard, a defensive voice-scam and deepfake audio analyzer helping families detect voice-cloning fraud and social engineering calls.
 
 Return strictly valid JSON matching the schema. Keep flaggedPhrases exact substrings of transcript whenever possible. Use plain, jargon-free language suitable for older adults.
 
@@ -322,169 +393,241 @@ Perform TWO independent evaluations on this audio clip in a single pass:
 - CRITICAL: If the audio contains only silence, music, tones, or background noise with no intelligible spoken words, return an empty string "" for "transcript", empty array [] for "flaggedPhrases", and 0.0 for "scamLanguageScore". Do NOT invent or guess speech.
 - If the speech is non-English or code-mixed, provide a clear English translation in "englishTranslation". If already pure English or empty, return an empty string "" for "englishTranslation".
 - Detect manipulative or high-risk scam patterns actually spoken in the audio and extract the EXACT matching substrings from "transcript" into "flaggedPhrases".
-- Each flagged phrase MUST use one of these exact categories:
-  - "Urgency" (time-pressure, emergency, or crisis phrasing)
-  - "Secrecy" (asking the listener to hide the call from family or others)
-  - "Payment Request" (requesting money transfer, UPI, cash, bank details, or OTPs)
-  - "Impersonation" (claiming to be a relative, official, or trusted person in distress)
+- Each flagged phrase MUST use one of these exact 4 categories according to these strict definitions and examples:
+  - "Impersonation": ONLY words or phrases where the speaker claims a familial, official, or trusted identity/relationship (e.g., "Mom,", "Dad,", "Nanna,", "Amma,", "It's me", "It's your son", "This is your manager", "Calling from bank security"). NEVER tag "I have been in an accident" or "hospital" as "Impersonation".
+  - "Urgency": Phrases creating panic, crisis, or immediate time pressure (e.g., "I am currently in trouble", "I have been in an accident", "my phone is dying", "hospital", "police", "right now", "immediately", "urgent").
+  - "Secrecy": Phrases isolating the victim or asking them to hide the call (e.g., "don't tell Mom", "don't tell anyone", "keep this between us", "evariki cheppaku").
+  - "Payment Request": Phrases demanding money, transfers, UPI, OTPs, or financial compensation (e.g., "asking for 40,000 rupees as compensation", "Please transfer 40,000 to this UPI ID", "send money now").
 - Compute scamLanguageScore from 0.0 (completely benign routine conversation or no speech) to 1.0 (high-pressure financial scam).`;
 
-      const response = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
-        contents: {
-          parts: [
-            {
-              inlineData: {
-                mimeType: cleanMimeType,
-                data: audioBase64,
-              },
-            },
-            {
-              text: prompt,
-            },
-          ],
-        },
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              syntheticProbability: {
-                type: Type.NUMBER,
-                description:
-                  'Probability between 0.0 and 1.0 that the voice is synthetic or cloned.',
-              },
-              acousticObservations: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description:
-                  '2 to 3 concise acoustic observations about prosody, breathing, noise floor, or phone compression.',
-              },
-              detectedLanguage: {
-                type: Type.STRING,
-                description:
-                  'Detected spoken language(s), e.g., English, Hindi, Telugu, or Telugu / English (Code-Mixed).',
-              },
-              transcript: {
-                type: Type.STRING,
-                description:
-                  'Accurate verbatim speech-to-text transcript preserving the spoken language.',
-              },
-              englishTranslation: {
-                type: Type.STRING,
-                description:
-                  'English translation if non-English or code-mixed; empty string if pure English.',
-              },
-              flaggedPhrases: {
-                type: Type.ARRAY,
-                items: {
-                  type: Type.OBJECT,
-                  properties: {
-                    phrase: {
-                      type: Type.STRING,
-                      description: 'Exact substring from transcript.',
-                    },
-                    category: {
-                      type: Type.STRING,
-                      description:
-                        'One of: Urgency, Secrecy, Payment Request, Impersonation.',
-                    },
-                    explanation: {
-                      type: Type.STRING,
-                      description: 'Short plain-language reason why this phrase is risky.',
-                    },
-                  },
-                  required: ['phrase', 'category', 'explanation'],
+      const analysisResponseSchema = {
+        type: Type.OBJECT,
+        properties: {
+          syntheticProbability: {
+            type: Type.NUMBER,
+            description:
+              'Probability between 0.0 and 1.0 that the voice is synthetic or cloned.',
+          },
+          acousticObservations: {
+            type: Type.ARRAY,
+            items: { type: Type.STRING },
+            description:
+              '2 to 3 concise acoustic observations about prosody, breathing, noise floor, or phone compression.',
+          },
+          detectedLanguage: {
+            type: Type.STRING,
+            description:
+              'Detected spoken language(s), e.g., English, Hindi, Telugu, or Telugu / English (Code-Mixed).',
+          },
+          transcript: {
+            type: Type.STRING,
+            description:
+              'Accurate verbatim speech-to-text transcript preserving the spoken language.',
+          },
+          englishTranslation: {
+            type: Type.STRING,
+            description:
+              'English translation if non-English or code-mixed; empty string if pure English.',
+          },
+          flaggedPhrases: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                phrase: {
+                  type: Type.STRING,
+                  description: 'Exact substring from transcript.',
+                },
+                category: {
+                  type: Type.STRING,
+                  description:
+                    'One of: Urgency, Secrecy, Payment Request, Impersonation.',
+                },
+                explanation: {
+                  type: Type.STRING,
+                  description: 'Short plain-language reason why this phrase is risky.',
                 },
               },
-              scamLanguageScore: {
-                type: Type.NUMBER,
-                description:
-                  'Score from 0.0 to 1.0 indicating likelihood of social-engineering scam intent.',
-              },
+              required: ['phrase', 'category', 'explanation'],
             },
-            required: [
-              'syntheticProbability',
-              'acousticObservations',
-              'detectedLanguage',
-              'transcript',
-              'englishTranslation',
-              'flaggedPhrases',
-              'scamLanguageScore',
-            ],
+          },
+          scamLanguageScore: {
+            type: Type.NUMBER,
+            description:
+              'Score from 0.0 to 1.0 indicating likelihood of social-engineering scam intent.',
           },
         },
-      });
+        required: [
+          'syntheticProbability',
+          'acousticObservations',
+          'detectedLanguage',
+          'transcript',
+          'englishTranslation',
+          'flaggedPhrases',
+          'scamLanguageScore',
+        ],
+      };
+
+      const callModelWithRetry = async (modelName: string) => {
+        for (let attempt = 0; attempt <= TRANSIENT_RETRY_DELAYS_MS.length; attempt++) {
+          try {
+            return await ai.models.generateContent({
+              model: modelName,
+              contents: {
+                parts: [
+                  {
+                    inlineData: {
+                      mimeType: cleanMimeType,
+                      data: audioBase64!,
+                    },
+                  },
+                  {
+                    text: 'Analyze this audio clip for synthetic voice-cloning artifacts and social-engineering scam language, and return JSON matching the schema.',
+                  },
+                ],
+              },
+              config: {
+                systemInstruction,
+                responseMimeType: 'application/json',
+                responseSchema: analysisResponseSchema,
+              },
+            });
+          } catch (err) {
+            const status = getGeminiErrorStatus(err);
+            const isTransient = status === 429 || status === 503;
+            if (isTransient && attempt < TRANSIENT_RETRY_DELAYS_MS.length) {
+              await sleep(TRANSIENT_RETRY_DELAYS_MS[attempt]);
+              continue;
+            }
+            throw err;
+          }
+        }
+        throw new Error('High traffic — please wait 15 seconds and try again.');
+      };
+
+      let response;
+      try {
+        response = await callModelWithRetry(activeAnalyzeModel);
+      } catch (err) {
+        const status = getGeminiErrorStatus(err);
+        if (activeAnalyzeModel === PRIMARY_ANALYZE_MODEL && status === 404) {
+          activeAnalyzeModel = FALLBACK_ANALYZE_MODEL;
+          response = await callModelWithRetry(FALLBACK_ANALYZE_MODEL);
+        } else {
+          throw err;
+        }
+      }
 
       audioBase64 = undefined;
 
-      const rawText = (response.text ?? '').trim();
-      if (!rawText) {
+      const rawResponseText = typeof response.text === 'string' ? response.text : '';
+      const cleanedText = rawResponseText.replace(/```json|```/gi, '').trim();
+      if (!cleanedText) {
         res.status(502).json({
           error: 'Gemini returned an empty response while analyzing this audio clip.',
         });
         return;
       }
 
-      const parsed = JSON.parse(rawText) as {
+      let parsed: {
         syntheticProbability?: unknown;
         acousticObservations?: unknown;
         detectedLanguage?: unknown;
+        languageDetected?: unknown;
         transcript?: unknown;
         englishTranslation?: unknown;
         flaggedPhrases?: unknown;
         scamLanguageScore?: unknown;
       };
 
-      const syntheticProbability = Math.max(
-        0,
-        Math.min(1, Number(parsed.syntheticProbability) || 0)
-      );
-      const scamLanguageScore = Math.max(
-        0,
-        Math.min(1, Number(parsed.scamLanguageScore) || 0)
-      );
+      try {
+        parsed = JSON.parse(cleanedText) as typeof parsed;
+      } catch {
+        const firstBrace = cleanedText.indexOf('{');
+        const lastBrace = cleanedText.lastIndexOf('}');
+        if (firstBrace !== -1 && lastBrace > firstBrace) {
+          parsed = JSON.parse(
+            cleanedText.slice(firstBrace, lastBrace + 1)
+          ) as typeof parsed;
+        } else {
+          throw new Error(
+            `Gemini returned non-JSON analysis output: ${cleanedText.slice(0, 140)}`
+          );
+        }
+      }
 
-      const acousticObservations = Array.isArray(parsed.acousticObservations)
+      const rawSynthetic = Number(parsed?.syntheticProbability ?? 0.5);
+      const syntheticProbability = Number.isFinite(rawSynthetic)
+        ? Math.max(0, Math.min(1, rawSynthetic))
+        : 0.5;
+
+      const rawScamScore = Number(parsed?.scamLanguageScore ?? 0);
+      const scamLanguageScore = Number.isFinite(rawScamScore)
+        ? Math.max(0, Math.min(1, rawScamScore))
+        : 0;
+
+      const acousticObservations = Array.isArray(parsed?.acousticObservations)
         ? parsed.acousticObservations
-            .filter((item): item is string => typeof item === 'string' && item.trim().length > 0)
+            .filter(
+              (item): item is string =>
+                typeof item === 'string' && item.trim().length > 0
+            )
             .slice(0, 4)
         : [];
 
-      const flaggedPhrases = Array.isArray(parsed.flaggedPhrases)
+      const rawFlagged = Array.isArray(parsed?.flaggedPhrases)
         ? parsed.flaggedPhrases
-            .filter(
-              (
-                item
-              ): item is { phrase: string; category: string; explanation: string } =>
-                Boolean(item) &&
-                typeof item === 'object' &&
-                typeof (item as { phrase?: unknown }).phrase === 'string' &&
-                (item as { phrase: string }).phrase.trim().length > 0
-            )
-            .map((item) => ({
-              phrase: item.phrase.trim(),
-              category: ALLOWED_CATEGORIES.has(item.category)
-                ? item.category
-                : 'Urgency',
-              explanation:
-                typeof item.explanation === 'string' && item.explanation.trim().length > 0
-                  ? item.explanation.trim()
-                  : 'Commonly used in high-pressure phone scams.',
-            }))
         : [];
+
+      const flaggedPhrases = rawFlagged
+        .filter(
+          (
+            item
+          ): item is {
+            phrase: string;
+            category?: string;
+            explanation?: string;
+          } =>
+            Boolean(item) &&
+            typeof item === 'object' &&
+            typeof (item as { phrase?: unknown }).phrase === 'string' &&
+            (item as { phrase: string }).phrase.trim().length > 0
+        )
+        .map((item) => ({
+          phrase: item.phrase.trim(),
+          category:
+            typeof item.category === 'string' &&
+            ALLOWED_CATEGORIES.has(item.category)
+              ? item.category
+              : 'Urgency',
+          explanation:
+            typeof item.explanation === 'string' &&
+            item.explanation.trim().length > 0
+              ? item.explanation.trim()
+              : 'Commonly used in high-pressure phone scams.',
+        }));
+
+      const detectedLanguage =
+        typeof parsed?.detectedLanguage === 'string' &&
+        parsed.detectedLanguage.trim()
+          ? parsed.detectedLanguage.trim()
+          : typeof parsed?.languageDetected === 'string' &&
+              parsed.languageDetected.trim()
+            ? parsed.languageDetected.trim()
+            : 'Unknown';
+
+      const transcript =
+        typeof parsed?.transcript === 'string' && parsed.transcript.trim()
+          ? parsed.transcript.trim()
+          : 'No speech detected in clip.';
 
       res.json({
         syntheticProbability,
         acousticObservations,
-        detectedLanguage:
-          typeof parsed.detectedLanguage === 'string' && parsed.detectedLanguage.trim()
-            ? parsed.detectedLanguage.trim()
-            : 'English',
-        transcript:
-          typeof parsed.transcript === 'string' ? parsed.transcript.trim() : '',
+        detectedLanguage,
+        transcript,
         englishTranslation:
-          typeof parsed.englishTranslation === 'string'
+          typeof parsed?.englishTranslation === 'string'
             ? parsed.englishTranslation.trim()
             : '',
         flaggedPhrases,

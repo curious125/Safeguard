@@ -71,6 +71,115 @@ function formatCategoryPlain(category: FlagCategory): string {
   }
 }
 
+const CRISIS_URGENCY_PATTERN =
+  /\b(accident|hospital|trouble|police|emergency|dying|icu|crash)\b/i;
+
+const KINSHIP_IMPERSONATION_PATTERN =
+  /\b(mom|dad|nanna|amma|it's me|its me|it’s me|your son|your daughter|this is your|calling from)\b/i;
+
+const DISTRESS_OR_SCAM_CONTEXT_PATTERN =
+  /\b(accident|hospital|trouble|police|urgent|emergency|dying|right now|immediately|send|transfer|upi|rupees|otp|money|pampu|bhejo|cheppaku|don't tell|dont tell|secret)\b/i;
+
+export function normalizeFlaggedPhrases(
+  rawPhrases: unknown,
+  transcript = ''
+): FlaggedPhrase[] {
+  const validCategories = new Set<FlagCategory>([
+    'Urgency',
+    'Secrecy',
+    'Payment Request',
+    'Impersonation',
+  ]);
+
+  const inputList = Array.isArray(rawPhrases) ? rawPhrases : [];
+  const normalized: FlaggedPhrase[] = [];
+
+  for (const raw of inputList) {
+    if (!raw || typeof raw !== 'object') continue;
+    const item = raw as {
+      phrase?: unknown;
+      category?: unknown;
+      explanation?: unknown;
+    };
+    const phrase = typeof item.phrase === 'string' ? item.phrase.trim() : '';
+    if (!phrase) continue;
+
+    let category: FlagCategory =
+      typeof item.category === 'string' &&
+      validCategories.has(item.category as FlagCategory)
+        ? (item.category as FlagCategory)
+        : 'Urgency';
+
+    let explanation =
+      typeof item.explanation === 'string' && item.explanation.trim()
+        ? item.explanation.trim()
+        : 'Commonly used in high-pressure phone scams.';
+
+    // Deterministic override 1: crisis terms (accident, hospital, trouble, police) are ALWAYS Urgency
+    if (CRISIS_URGENCY_PATTERN.test(phrase)) {
+      if (category === 'Impersonation') {
+        explanation =
+          'Uses a sudden crisis or emergency claim to create panic and pressure fast action.';
+      }
+      category = 'Urgency';
+    } else if (
+      KINSHIP_IMPERSONATION_PATTERN.test(phrase) &&
+      category !== 'Secrecy' &&
+      category !== 'Payment Request'
+    ) {
+      // Deterministic override 2: kinship/identity openings in distress context are Impersonation
+      category = 'Impersonation';
+    }
+
+    normalized.push({ phrase, category, explanation });
+  }
+
+  // Ensure kinship/identity openings in transcript during a distress/scam context are tagged Impersonation
+  if (
+    transcript &&
+    (normalized.length > 0 || DISTRESS_OR_SCAM_CONTEXT_PATTERN.test(transcript))
+  ) {
+    const kinshipMatch = transcript.match(KINSHIP_IMPERSONATION_PATTERN);
+    if (kinshipMatch?.[0]) {
+      const matchedOpening = kinshipMatch[0];
+      const alreadyHasImpersonation = normalized.some(
+        (p) => p.category === 'Impersonation'
+      );
+      const alreadyCoversToken = normalized.some((p) =>
+        p.phrase.toLowerCase().includes(matchedOpening.toLowerCase())
+      );
+
+      if (!alreadyHasImpersonation && !alreadyCoversToken) {
+        normalized.unshift({
+          phrase: matchedOpening,
+          category: 'Impersonation',
+          explanation:
+            'Opens with a trusted family or identity claim inside a stressful or urgent call.',
+        });
+      }
+    }
+
+    // Ensure explicit crisis words in transcript are flagged as Urgency if not already covered
+    const crisisMatch = transcript.match(CRISIS_URGENCY_PATTERN);
+    if (crisisMatch?.[0]) {
+      const matchedCrisis = crisisMatch[0];
+      const alreadyCoversCrisis = normalized.some((p) =>
+        p.phrase.toLowerCase().includes(matchedCrisis.toLowerCase())
+      );
+      if (!alreadyCoversCrisis) {
+        normalized.push({
+          phrase: matchedCrisis,
+          category: 'Urgency',
+          explanation:
+            'Introduces a sudden emergency or crisis to pressure immediate compliance.',
+        });
+      }
+    }
+  }
+
+  return normalized;
+}
+
 export function calculateCombinedRisk(
   syntheticProbability: number,
   scamLanguageScore: number,
@@ -78,17 +187,24 @@ export function calculateCombinedRisk(
   transcript = '',
   englishTranslation = ''
 ): RiskFusionResult {
-  const clampedSynthetic = Math.max(0, Math.min(1, syntheticProbability));
-  const clampedScam = Math.max(0, Math.min(1, scamLanguageScore));
+  const safeSynth = Number(syntheticProbability ?? 0.5);
+  const clampedSynthetic = Number.isFinite(safeSynth)
+    ? Math.max(0, Math.min(1, safeSynth))
+    : 0.5;
+  const safeScam = Number(scamLanguageScore ?? 0);
+  const clampedScam = Number.isFinite(safeScam)
+    ? Math.max(0, Math.min(1, safeScam))
+    : 0;
+  const safeFlags = Array.isArray(flaggedPhrases) ? flaggedPhrases : [];
   const authenticityLabel = getAuthenticityLabel(clampedSynthetic);
 
-  const hasPaymentFlag = flaggedPhrases.some(
+  const hasPaymentFlag = safeFlags.some(
     (p) => p.category === 'Payment Request'
   );
   const hasPaymentMention = detectPaymentMention(
     transcript,
     englishTranslation,
-    flaggedPhrases
+    safeFlags
   );
 
   let riskLevel: RiskLevel;

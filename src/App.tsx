@@ -17,14 +17,21 @@ import type {
   FullAnalysisReport,
   GeminiAudioAnalysis,
 } from './types/safevoice';
-import { blobToBase64, DEMO_SCENARIOS } from './utils/audioHelpers';
+import {
+  blobToBase64,
+  DEMO_PRESET_ANALYSES,
+  DEMO_SCENARIOS,
+} from './utils/audioHelpers';
 import {
   clearFamilyCircleStorage,
   DEFAULT_FAMILY_CIRCLE,
   readFamilyCircleFromStorage,
   saveFamilyCircle,
 } from './utils/familyCircle';
-import { calculateCombinedRisk } from './utils/riskFusion';
+import {
+  calculateCombinedRisk,
+  normalizeFlaggedPhrases,
+} from './utils/riskFusion';
 
 interface ActiveSession {
   token: string;
@@ -59,6 +66,7 @@ export default function App() {
 
   const captureSectionRef = useRef<HTMLDivElement | null>(null);
   const resultsSectionRef = useRef<HTMLDivElement | null>(null);
+  const analyzingLockRef = useRef(false);
 
   // Revoke any dangling objectURL on unmount
   useEffect(() => {
@@ -119,7 +127,7 @@ export default function App() {
     }
 
     if (action?.type === 'demo') {
-      await executeLiveDemoWithToken(action.scenarioId, session.token);
+      runLocalDemoScenario(action.scenarioId);
       return;
     }
 
@@ -211,12 +219,15 @@ export default function App() {
   }
 
   async function analyzeClipWithToken(clip: LoadedAudioClip, token: string) {
+    if (analyzingLockRef.current) return;
+    analyzingLockRef.current = true;
     setIsAnalyzing(true);
     setErrorMessage(null);
     setBufferClearedNotice(false);
 
     const startedAt = performance.now();
     let audioBase64: string | null = null;
+    let didSucceed = false;
 
     try {
       audioBase64 = await blobToBase64(clip.blob);
@@ -238,23 +249,111 @@ export default function App() {
         return;
       }
 
-      const payload = (await response.json().catch(() => null)) as
-        | (GeminiAudioAnalysis & { error?: string })
-        | null;
+      const rawResponseText = await response.text();
+      const cleanedResponseText = rawResponseText
+        .replace(/```json|```/gi, '')
+        .trim();
 
-      if (!response.ok || !payload) {
-        throw new Error(
-          payload?.error ||
-            'Audio verification failed. Please check your connection and try again.'
-        );
+      type AnalyzeResponsePayload = Partial<GeminiAudioAnalysis> & {
+        error?: string;
+        languageDetected?: unknown;
+      };
+
+      let payload: AnalyzeResponsePayload | null = null;
+
+      if (cleanedResponseText) {
+        try {
+          payload = JSON.parse(
+            cleanedResponseText
+          ) as AnalyzeResponsePayload | null;
+        } catch {
+          if (response.ok) {
+            throw new Error(
+              `Invalid JSON response from analyzer: ${cleanedResponseText.slice(0, 140)}`
+            );
+          }
+        }
       }
 
-      const fusion = calculateCombinedRisk(
-        payload.syntheticProbability,
-        payload.scamLanguageScore,
+      if (!response.ok) {
+        if (response.status === 429 || response.status === 503) {
+          throw new Error('High traffic — please wait 15 seconds and try again.');
+        }
+        const detail =
+          payload?.error ||
+          (cleanedResponseText && !cleanedResponseText.startsWith('<')
+            ? cleanedResponseText.slice(0, 240)
+            : `Server returned HTTP ${response.status}`);
+        throw new Error(detail);
+      }
+
+      if (!payload || typeof payload !== 'object') {
+        throw new Error('Analyzer returned an empty or malformed response.');
+      }
+
+      const rawSynth = Number(payload.syntheticProbability ?? 0.5);
+      const syntheticProbability = Number.isFinite(rawSynth)
+        ? Math.max(0, Math.min(1, rawSynth))
+        : 0.5;
+
+      const rawScam = Number(payload.scamLanguageScore ?? 0);
+      const scamLanguageScore = Number.isFinite(rawScam)
+        ? Math.max(0, Math.min(1, rawScam))
+        : 0;
+
+      const transcript = String(
+        typeof payload.transcript === 'string' && payload.transcript.trim()
+          ? payload.transcript.trim()
+          : 'No speech detected in clip.'
+      );
+
+      const detectedLanguage = String(
+        (typeof payload.detectedLanguage === 'string' &&
+        payload.detectedLanguage.trim()
+          ? payload.detectedLanguage.trim()
+          : '') ||
+          (typeof payload.languageDetected === 'string' &&
+          payload.languageDetected.trim()
+            ? payload.languageDetected.trim()
+            : '') ||
+          'Unknown'
+      );
+
+      const englishTranslation =
+        typeof payload.englishTranslation === 'string'
+          ? payload.englishTranslation.trim()
+          : '';
+
+      const acousticObservations = Array.isArray(payload.acousticObservations)
+        ? payload.acousticObservations.filter(
+            (item): item is string =>
+              typeof item === 'string' && item.trim().length > 0
+          )
+        : [];
+
+      const flaggedPhrases = normalizeFlaggedPhrases(
         payload.flaggedPhrases,
-        payload.transcript,
-        payload.englishTranslation
+        transcript === 'No speech detected in clip.' ? '' : transcript
+      );
+
+      const normalizedAnalysis: GeminiAudioAnalysis = {
+        syntheticProbability,
+        acousticObservations,
+        detectedLanguage,
+        transcript,
+        englishTranslation,
+        flaggedPhrases,
+        scamLanguageScore,
+      };
+
+      const fusion = calculateCombinedRisk(
+        normalizedAnalysis.syntheticProbability,
+        normalizedAnalysis.scamLanguageScore,
+        normalizedAnalysis.flaggedPhrases,
+        normalizedAnalysis.transcript === 'No speech detected in clip.'
+          ? ''
+          : normalizedAnalysis.transcript,
+        normalizedAnalysis.englishTranslation
       );
 
       const processingMs = Math.max(
@@ -262,15 +361,17 @@ export default function App() {
         Math.round(performance.now() - startedAt)
       );
 
-      setReport({
-        analysis: payload,
+      const finalResult: FullAnalysisReport = {
+        analysis: normalizedAnalysis,
         fusion,
         analyzedAt: new Date().toISOString(),
         clipLabel: clip.label,
         processingMs,
-      });
+      };
 
-      URL.revokeObjectURL(clip.objectUrl);
+      setErrorMessage(null);
+      setReport(finalResult);
+      didSucceed = true;
       setAudioClip(null);
       setBufferClearedNotice(true);
 
@@ -281,92 +382,92 @@ export default function App() {
         });
       }, 80);
     } catch (err) {
-      setErrorMessage(
-        err instanceof Error
-          ? err.message
-          : 'Unable to analyze this audio clip right now.'
-      );
+      setErrorMessage(err instanceof Error ? err.message : String(err));
     } finally {
+      if (didSucceed) {
+        try {
+          URL.revokeObjectURL(clip.objectUrl);
+        } catch {
+          // Ignore cleanup errors after report is rendered
+        }
+      }
       audioBase64 = null;
+      analyzingLockRef.current = false;
       setIsAnalyzing(false);
     }
   }
 
   async function handleAnalyzeClip() {
-    if (!audioClip || isAnalyzing || !authSession) return;
+    if (!audioClip || isAnalyzing || analyzingLockRef.current || !authSession) {
+      return;
+    }
     await analyzeClipWithToken(audioClip, authSession.token);
   }
 
-  async function executeLiveDemoWithToken(
-    scenarioId: DemoScenario['id'],
-    token: string
-  ) {
+  function runLocalDemoScenario(scenarioId: DemoScenario['id']) {
+    if (analyzingLockRef.current) return;
+
     const scenario =
       DEMO_SCENARIOS.find((s) => s.id === scenarioId) ?? DEMO_SCENARIOS[0];
+    const preset = DEMO_PRESET_ANALYSES[scenario.id];
+
+    if (audioClip?.objectUrl) {
+      try {
+        URL.revokeObjectURL(audioClip.objectUrl);
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+
+    const flaggedPhrases = normalizeFlaggedPhrases(
+      preset.flaggedPhrases,
+      preset.transcript
+    );
+
+    const fusion = calculateCombinedRisk(
+      preset.syntheticProbability,
+      preset.scamLanguageScore,
+      flaggedPhrases,
+      preset.transcript,
+      preset.englishTranslation
+    );
 
     setActiveView('verify');
     setCaptureTab('upload');
+    setAudioClip(null);
     setErrorMessage(null);
-    setReport(null);
-    setIsAnalyzing(true);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    setBufferClearedNotice(false);
+    setReport({
+      analysis: {
+        ...preset,
+        flaggedPhrases,
+      },
+      fusion,
+      analyzedAt: new Date().toISOString(),
+      clipLabel: `Demo Preset · ${scenario.title}`,
+      processingMs: 12,
+    });
 
-    try {
-      const response = await fetch(`/api/demo-clip/${scenario.id}`, {
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
+    window.setTimeout(() => {
+      resultsSectionRef.current?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'start',
       });
-
-      if (response.status === 401) {
-        await handleSignOut();
-        return;
-      }
-
-      if (!response.ok) {
-        const errPayload = (await response.json().catch(() => null)) as {
-          error?: string;
-        } | null;
-        throw new Error(
-          errPayload?.error || 'Could not load the demo audio clip.'
-        );
-      }
-
-      const wavBlob = await response.blob();
-      const objectUrl = URL.createObjectURL(wavBlob);
-      const demoClip: LoadedAudioClip = {
-        blob: wavBlob,
-        objectUrl,
-        label: `Demo · ${scenario.title}`,
-        mimeType: 'audio/wav',
-        sizeBytes: wavBlob.size,
-        source: 'demo',
-      };
-
-      handleClipLoaded(demoClip);
-      await analyzeClipWithToken(demoClip, token);
-    } catch (err) {
-      setIsAnalyzing(false);
-      setErrorMessage(
-        err instanceof Error
-          ? err.message
-          : 'Unable to run the live demo scenario right now.'
-      );
-    }
+    }, 60);
   }
 
   function handleRunLiveDemoFromHome(scenarioId: DemoScenario['id']) {
     if (!authSession) {
       setPendingAction({ type: 'demo', scenarioId });
       setAuthNotice(
-        'Sign in to load this spoken scenario and run live Gemini voice analysis.'
+        'Sign in to view this demo scam scenario in the Voice Analyzer.'
       );
       setActiveView('auth');
       window.scrollTo({ top: 0, behavior: 'smooth' });
       return;
     }
 
-    void executeLiveDemoWithToken(scenarioId, authSession.token);
+    runLocalDemoScenario(scenarioId);
   }
 
   function handleStartLiveRecord() {
@@ -387,7 +488,7 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900">
+    <div className="min-h-screen flex flex-col bg-slate-50 text-slate-900 overflow-x-hidden">
       <Header
         activeView={activeView}
         onSelectView={handleSelectView}
@@ -396,7 +497,7 @@ export default function App() {
         onSignOut={handleSignOut}
       />
 
-      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 sm:py-10">
+      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-10 min-w-0">
         {activeView === 'home' && (
           <HomePage
             onGoToAnalyzer={() => handleSelectView('verify')}
@@ -427,13 +528,13 @@ export default function App() {
         )}
 
         {activeView === 'verify' && authSession && (
-          <div className="space-y-8">
-            <section className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-6">
-              <div className="max-w-3xl">
-                <h1 className="text-3xl sm:text-4xl font-extrabold tracking-tight text-slate-900 text-balance">
+          <div className="space-y-8 min-w-0">
+            <section className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-6 min-w-0">
+              <div className="max-w-3xl min-w-0">
+                <h1 className="text-2xl sm:text-3xl lg:text-4xl font-extrabold tracking-tight text-slate-900 break-words text-balance">
                   Voice Analyzer &amp; Scam Script Detector
                 </h1>
-                <p className="mt-3 text-lg text-slate-600 leading-relaxed">
+                <p className="mt-3 text-base sm:text-lg text-slate-600 leading-relaxed break-words">
                   Signed in as{' '}
                   <strong className="text-slate-900">{authSession.username}</strong>.
                   Upload a voice note or record a call clip to check for AI voice cloning and scam pressure tactics.
@@ -442,7 +543,7 @@ export default function App() {
                   <button
                     type="button"
                     onClick={handleStartLiveRecord}
-                    className="inline-flex items-center gap-2 px-5 py-2.5 rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-sm sm:text-base font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700"
+                    className="w-full sm:w-auto inline-flex items-center justify-center gap-2 px-4 py-3 min-h-[48px] rounded-lg bg-blue-700 hover:bg-blue-800 text-white text-sm sm:text-base font-semibold transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-blue-700"
                   >
                     <Mic className="w-4 h-4" aria-hidden="true" />
                     <span>Record Live Call</span>
@@ -450,7 +551,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="bg-white border border-slate-200 rounded-xl px-5 py-4 shrink-0">
+              <div className="bg-white border border-slate-200 rounded-xl px-5 py-4 shrink-0 min-w-0">
                 <div className="text-xs font-semibold text-slate-500 uppercase tracking-wider">
                   Saved Family Circle
                 </div>
@@ -476,13 +577,13 @@ export default function App() {
 
             <div ref={captureSectionRef}>
               <AudioCaptureCard
-                authToken={authSession.token}
                 activeTab={captureTab}
                 onTabChange={setCaptureTab}
                 audioClip={audioClip}
                 onClipLoaded={handleClipLoaded}
                 onClearClip={handleClearClip}
                 onAnalyze={handleAnalyzeClip}
+                onRunDemoScenario={runLocalDemoScenario}
                 isAnalyzing={isAnalyzing}
                 errorMessage={errorMessage}
                 onError={setErrorMessage}
@@ -530,9 +631,22 @@ export default function App() {
 
       <footer className="border-t border-slate-200 bg-white mt-12">
         <div className="max-w-6xl mx-auto px-4 sm:px-6 lg:px-8 py-6 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 text-sm text-slate-600">
-          <p>
-            AI-assisted verification tool. Acoustic scores are probabilistic; always verify urgent money requests out-of-band.
-          </p>
+          <div className="flex items-center gap-2.5 min-w-0">
+            <span className="w-7 h-7 rounded-lg overflow-hidden border border-slate-200/80 bg-white shrink-0 inline-flex items-center justify-center">
+              <img
+                src="/logo.png"
+                alt="SafeVoice Guard"
+                referrerPolicy="no-referrer"
+                className="w-full h-full object-cover object-top origin-top scale-[1.38]"
+              />
+            </span>
+            <p className="min-w-0 break-words">
+              <strong className="font-semibold text-slate-800">
+                SafeVoice Guard
+              </strong>{' '}
+              · AI-assisted verification tool. Acoustic scores are probabilistic; always verify urgent money requests out-of-band.
+            </p>
+          </div>
           <p className="shrink-0 font-medium text-slate-700">
             Zero audio stored · In-memory scoring only
           </p>
