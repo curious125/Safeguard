@@ -162,9 +162,13 @@ export function AudioCaptureCard({
 
       recorder.onstop = () => {
         const elapsedMs = Date.now() - recordingStartTimeRef.current;
-        const rawMime = recorder.mimeType || chosenMime || 'audio/webm';
-        const cleanMime = normalizeAudioMimeType(rawMime);
-        const recordedBlob = new Blob(chunksRef.current, { type: cleanMime });
+        const baseRecorderMime = (recorder.mimeType || chosenMime || 'audio/webm')
+          .split(';')[0]
+          .trim();
+        const recordedBlob = new Blob(chunksRef.current, {
+          type: baseRecorderMime || 'audio/webm',
+        });
+        const cleanMime = normalizeAudioMimeType(recordedBlob);
         chunksRef.current = [];
         stopMediaCleanup();
         setIsRecording(false);

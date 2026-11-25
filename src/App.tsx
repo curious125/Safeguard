@@ -15,10 +15,8 @@ import type {
   DemoScenario,
   FamilyCircleConfig,
   FullAnalysisReport,
-  GeminiAudioAnalysis,
 } from './types/safevoice';
 import {
-  blobToBase64,
   DEMO_PRESET_ANALYSES,
   DEMO_SCENARIOS,
 } from './utils/audioHelpers';
@@ -32,6 +30,10 @@ import {
   calculateCombinedRisk,
   normalizeFlaggedPhrases,
 } from './utils/riskFusion';
+import {
+  analyzeAudioViaServer,
+  UnauthorizedAnalysisError,
+} from './services/geminiAnalyzer';
 
 interface ActiveSession {
   token: string;
@@ -186,13 +188,17 @@ export default function App() {
         return;
       }
       if (response.ok) {
-        const data = (await response.json()) as {
-          familyCircle?: FamilyCircleConfig;
-        };
-        if (data.familyCircle) {
-          setFamilyCircle(data.familyCircle);
-          saveFamilyCircle(data.familyCircle);
-          setStoredFamilyCircle(data.familyCircle);
+        const rawText = await response.text();
+        const trimmed = rawText.replace(/```json|```/gi, '').trim();
+        if (trimmed && !trimmed.startsWith('<')) {
+          const data = JSON.parse(trimmed) as {
+            familyCircle?: FamilyCircleConfig;
+          };
+          if (data.familyCircle) {
+            setFamilyCircle(data.familyCircle);
+            saveFamilyCircle(data.familyCircle);
+            setStoredFamilyCircle(data.familyCircle);
+          }
         }
       }
     } catch {
@@ -218,7 +224,7 @@ export default function App() {
     setErrorMessage(null);
   }
 
-  async function analyzeClipWithToken(clip: LoadedAudioClip, token: string) {
+  async function runAudioAnalysis(clip: LoadedAudioClip, token: string) {
     if (analyzingLockRef.current) return;
     analyzingLockRef.current = true;
     setIsAnalyzing(true);
@@ -226,125 +232,14 @@ export default function App() {
     setBufferClearedNotice(false);
 
     const startedAt = performance.now();
-    let audioBase64: string | null = null;
     let didSucceed = false;
 
     try {
-      audioBase64 = await blobToBase64(clip.blob);
-
-      const response = await fetch('/api/analyze', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          audioBase64,
-          mimeType: clip.mimeType,
-        }),
-      });
-
-      if (response.status === 401) {
-        await handleSignOut();
-        return;
-      }
-
-      const rawResponseText = await response.text();
-      const cleanedResponseText = rawResponseText
-        .replace(/```json|```/gi, '')
-        .trim();
-
-      type AnalyzeResponsePayload = Partial<GeminiAudioAnalysis> & {
-        error?: string;
-        languageDetected?: unknown;
-      };
-
-      let payload: AnalyzeResponsePayload | null = null;
-
-      if (cleanedResponseText) {
-        try {
-          payload = JSON.parse(
-            cleanedResponseText
-          ) as AnalyzeResponsePayload | null;
-        } catch {
-          if (response.ok) {
-            throw new Error(
-              `Invalid JSON response from analyzer: ${cleanedResponseText.slice(0, 140)}`
-            );
-          }
-        }
-      }
-
-      if (!response.ok) {
-        if (response.status === 429 || response.status === 503) {
-          throw new Error('High traffic — please wait 15 seconds and try again.');
-        }
-        const detail =
-          payload?.error ||
-          (cleanedResponseText && !cleanedResponseText.startsWith('<')
-            ? cleanedResponseText.slice(0, 240)
-            : `Server returned HTTP ${response.status}`);
-        throw new Error(detail);
-      }
-
-      if (!payload || typeof payload !== 'object') {
-        throw new Error('Analyzer returned an empty or malformed response.');
-      }
-
-      const rawSynth = Number(payload.syntheticProbability ?? 0.5);
-      const syntheticProbability = Number.isFinite(rawSynth)
-        ? Math.max(0, Math.min(1, rawSynth))
-        : 0.5;
-
-      const rawScam = Number(payload.scamLanguageScore ?? 0);
-      const scamLanguageScore = Number.isFinite(rawScam)
-        ? Math.max(0, Math.min(1, rawScam))
-        : 0;
-
-      const transcript = String(
-        typeof payload.transcript === 'string' && payload.transcript.trim()
-          ? payload.transcript.trim()
-          : 'No speech detected in clip.'
+      const normalizedAnalysis = await analyzeAudioViaServer(
+        clip.blob,
+        token,
+        clip.mimeType
       );
-
-      const detectedLanguage = String(
-        (typeof payload.detectedLanguage === 'string' &&
-        payload.detectedLanguage.trim()
-          ? payload.detectedLanguage.trim()
-          : '') ||
-          (typeof payload.languageDetected === 'string' &&
-          payload.languageDetected.trim()
-            ? payload.languageDetected.trim()
-            : '') ||
-          'Unknown'
-      );
-
-      const englishTranslation =
-        typeof payload.englishTranslation === 'string'
-          ? payload.englishTranslation.trim()
-          : '';
-
-      const acousticObservations = Array.isArray(payload.acousticObservations)
-        ? payload.acousticObservations.filter(
-            (item): item is string =>
-              typeof item === 'string' && item.trim().length > 0
-          )
-        : [];
-
-      const flaggedPhrases = normalizeFlaggedPhrases(
-        payload.flaggedPhrases,
-        transcript === 'No speech detected in clip.' ? '' : transcript
-      );
-
-      const normalizedAnalysis: GeminiAudioAnalysis = {
-        syntheticProbability,
-        acousticObservations,
-        detectedLanguage,
-        transcript,
-        englishTranslation,
-        flaggedPhrases,
-        scamLanguageScore,
-      };
 
       const fusion = calculateCombinedRisk(
         normalizedAnalysis.syntheticProbability,
@@ -382,6 +277,10 @@ export default function App() {
         });
       }, 80);
     } catch (err) {
+      if (err instanceof UnauthorizedAnalysisError) {
+        await handleSignOut();
+        return;
+      }
       setErrorMessage(err instanceof Error ? err.message : String(err));
     } finally {
       if (didSucceed) {
@@ -391,7 +290,6 @@ export default function App() {
           // Ignore cleanup errors after report is rendered
         }
       }
-      audioBase64 = null;
       analyzingLockRef.current = false;
       setIsAnalyzing(false);
     }
@@ -401,7 +299,7 @@ export default function App() {
     if (!audioClip || isAnalyzing || analyzingLockRef.current || !authSession) {
       return;
     }
-    await analyzeClipWithToken(audioClip, authSession.token);
+    await runAudioAnalysis(audioClip, authSession.token);
   }
 
   function runLocalDemoScenario(scenarioId: DemoScenario['id']) {
@@ -622,7 +520,7 @@ export default function App() {
                   familyCircle={familyCircle}
                   onOpenFamilyCircle={() => setActiveView('family')}
                 />
-                <ResultsDashboard report={report} />
+                <ResultsDashboard key={report.analyzedAt} report={report} />
               </div>
             )}
           </div>

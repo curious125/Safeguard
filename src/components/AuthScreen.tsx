@@ -90,9 +90,24 @@ export function AuthScreen({
         body: JSON.stringify(body),
       });
 
-      const payload = (await response.json().catch(() => null)) as
-        | (AuthSessionPayload & { error?: string })
-        | null;
+      const rawText = await response.text();
+      const cleanedText = rawText.replace(/```json|```/gi, '').trim();
+      if (cleanedText.startsWith('<')) {
+        throw new Error(
+          'Authentication service returned an HTML response. Please refresh and try again.'
+        );
+      }
+
+      let payload: (AuthSessionPayload & { error?: string }) | null = null;
+      if (cleanedText) {
+        try {
+          payload = JSON.parse(cleanedText) as AuthSessionPayload & {
+            error?: string;
+          };
+        } catch {
+          payload = null;
+        }
+      }
 
       if (!response.ok || !payload?.token) {
         throw new Error(

@@ -120,7 +120,10 @@ function sleep(ms: number): Promise<void> {
 }
 
 function parseReadableErrorMessage(rawMessage: string): string {
-  const trimmed = rawMessage.trim();
+  const trimmed = rawMessage.replace(/```json|```/gi, '').trim();
+  if (!trimmed || trimmed.startsWith('<')) {
+    return trimmed;
+  }
   try {
     const parsed = JSON.parse(trimmed) as {
       error?: { message?: string; code?: number; status?: string };
@@ -528,6 +531,12 @@ Perform TWO independent evaluations on this audio clip in a single pass:
         });
         return;
       }
+      if (cleanedText.startsWith('<')) {
+        res.status(502).json({
+          error: 'Upstream service returned an HTML error page instead of JSON.',
+        });
+        return;
+      }
 
       let parsed: {
         syntheticProbability?: unknown;
@@ -642,6 +651,18 @@ Perform TWO independent evaluations on this audio clip in a single pass:
     }
   });
 
+  app.use('/api', (_req: Request, res: Response) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+
+  app.use(
+    '/api',
+    (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
+      const { status, message } = extractErrorDetails(err);
+      res.status(status).json({ error: message });
+    }
+  );
+
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
@@ -652,7 +673,7 @@ Perform TWO independent evaluations on this audio clip in a single pass:
   } else {
     const distDir = path.resolve(__dirname, 'dist');
     app.use(express.static(distDir));
-    app.get('/{*splat}', (_req: Request, res: Response) => {
+    app.get('*', (_req: Request, res: Response) => {
       res.sendFile(path.join(distDir, 'index.html'));
     });
   }
