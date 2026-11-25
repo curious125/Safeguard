@@ -1,0 +1,10 @@
+{
+  "name": "SafeVoice Guard",
+  "description": "Deepfake and voice-clone scam alert system with dual-signal acoustic authenticity checks, multilingual scam-script detection, and Family Circle protection.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
